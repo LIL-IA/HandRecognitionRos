@@ -3,12 +3,13 @@
 Hand Gesture Robot Control - ROS2 Node
 
 This node uses MediaPipe to detect hand gestures and publishes
-velocity commands to control a robot.
+velocity commands to control a robot using a handlebar analogy.
 
 Controls:
-- Left hand: Speed control (openness determines magnitude, palm facing = forward, back = reverse)
-- Right hand: Direction control (fist roll angle for steering)
+- Both hands: Handlebar-style control (push forward/back for speed, twist for steering)
+- Hold both hands still: Auto-calibrate neutral position
 - Both hands open for 1.5s: Toggle drive enable/disable
+- Press 'C': Manual recalibration
 """
 
 import time
@@ -36,13 +37,6 @@ RING_MCP, RING_PIP, RING_DIP, RING_TIP = 13, 14, 15, 16
 PINKY_MCP, PINKY_PIP, PINKY_DIP, PINKY_TIP = 17, 18, 19, 20
 
 
-def val_gap(prev, new, gap=0.05):
-    """Apply gap filtering to smooth value changes."""
-    if abs(new - prev) < gap:
-        return prev
-    return new
-
-
 def clamp(v, lo, hi):
     """Clamp value between lo and hi."""
     return max(lo, min(hi, v))
@@ -51,6 +45,18 @@ def clamp(v, lo, hi):
 def deadzone(x, dz):
     """Apply deadzone to input value."""
     return 0.0 if abs(x) < dz else (x - np.sign(x) * dz) / (1 - dz)
+
+
+def quantize(x, step):
+    """Quantize value to discrete steps."""
+    if step <= 0:
+        return x
+    return round(x / step) * step
+
+
+def lerp(a, b, t):
+    """Linear interpolation between a and b."""
+    return a + (b - a) * t
 
 
 def draw_progress_bar(img, x, y, w, h, p, color=(0, 255, 255)):
@@ -80,6 +86,11 @@ def _angle_deg(u, v):
     return math.degrees(math.acos(d))
 
 
+def _angle_diff_deg(a, b):
+    """Signed shortest distance a-b in degrees."""
+    return ((a - b + 180.0) % 360.0) - 180.0
+
+
 def _hand_size_ref(lm):
     """Get reference hand size for normalization."""
     w = _v(lm, WRIST)
@@ -103,6 +114,31 @@ def _palm_center(lm):
         _v(lm, PINKY_MCP),
     ]
     return np.mean(pts, axis=0)
+
+
+def _handlebar_metrics(lm_left, lm_right):
+    """Calculate handlebar metrics from both hands."""
+    left_palm = _palm_center(lm_left)
+    right_palm = _palm_center(lm_right)
+    vec_lr = right_palm - left_palm
+
+    span_xy = float(np.linalg.norm(vec_lr[:2]))
+    span_3d = float(np.linalg.norm(vec_lr))
+    mean_z = float((left_palm[2] + right_palm[2]) / 2.0)
+    depth_diff = float(right_palm[2] - left_palm[2])  # >0: right farther than left
+    size_avg = float((_hand_size_ref(lm_left) + _hand_size_ref(lm_right)) / 2.0)
+    angle_deg = math.degrees(math.atan2(vec_lr[1], vec_lr[0]))  # orientation in image plane
+
+    return {
+        'left_palm': left_palm,
+        'right_palm': right_palm,
+        'span_xy': span_xy,
+        'span_3d': span_3d,
+        'mean_z': mean_z,
+        'depth_diff': depth_diff,
+        'size_avg': size_avg,
+        'angle_deg': angle_deg,
+    }
 
 
 # -------- Finger joint tuples --------
@@ -175,27 +211,8 @@ def palm_facing_sign(lm):
     return 0, dz
 
 
-def direction_from_right_fist_roll(lm):
-    """Get steering direction from right hand fist roll angle."""
-    a = lm[INDEX_MCP]
-    b = lm[PINKY_MCP]
-    dx = b.x - a.x
-    dy = b.y - a.y
-    ang_deg = math.degrees(math.atan2(dy, dx))
-    ang_deg = ((ang_deg - 90.0 + 180.0) % 360.0) - 180.0
-    ang_deg_clamped = clamp(ang_deg, -50.0, 50.0)
-    val = deadzone(ang_deg_clamped / 50.0, 4.0 / 50.0)
-    return clamp(val, -1.0, 1.0), ang_deg
-
-
-def right_is_fist_simple(lm):
-    """Check if right hand is making a fist gesture."""
-    curls = [_curl_pip_deg(lm, fids) for fids in (INDEX, MIDDLE, RING, PINKY)]
-    return sum(1 for c in curls if c >= 45.0) >= 3
-
-
 class DriveState:
-    """State machine for drive control."""
+    """State machine for handlebar-style drive control."""
 
     def __init__(self):
         self.enabled = False
@@ -208,7 +225,34 @@ class DriveState:
         self._f_speed = 0.0
         self._f_dir = 0.0
 
-        self.left_speed_sign = +1  # hold last sign when facing ambiguous
+        self.speed_cmd = 0
+        self.direction_cmd = 0
+        self.quant_step = 0.1  # -> integer steps -10..10
+        self.command_hysteresis = 0.55  # fraction of a step to keep previous cmd
+        self.zero_lock = 0.02  # lock tiny filtered values to zero
+        self.left_speed_sign = +1  # kept for compatibility
+
+        self.baseline = None
+        self._last_full_seen = time.time()
+        self._lost = False
+        self.fail_timeout = 0.4  # seconds before applying safety decay
+        self.decay_rate = 6.0  # how fast to decay when lost (per second)
+        self.metrics_lp = None  # low-pass filter for handlebar metrics
+        self.metrics_smoothing = 6.0
+
+        # Calibration (fixed origin)
+        self.calibrated = False
+        self.calibrating = False
+        self.calib_progress = 0.0
+        self.calib_hold = 0.8  # seconds of stability to lock origin
+        self.calib_stable_norm_thr = 0.08
+        self.prev_metrics = None
+        self.calib_requested = False
+
+        # Ranges for bike-like control
+        self.depth_range = 0.06  # z delta for full speed
+        self.size_range = 0.40  # relative size delta for full speed
+        self.turn_depth_range = 0.05  # z diff between hands for full steer
 
     def update_arming(self, both_open):
         """Update arming state based on whether both hands are open."""
@@ -228,28 +272,191 @@ class DriveState:
             self._t0 = None
             return None
 
-    def set_speed_dir(self, spd, direc):
-        """Set speed and direction with gap filtering."""
-        self._f_speed = val_gap(self._f_speed, spd)
-        self._f_dir = val_gap(self._f_dir, direc)
-        self.speed = clamp(self._f_speed, -1, 1)
-        self.direction = clamp(self._f_dir, -1, 1)
+    def reset_calibration(self):
+        """Reset calibration state."""
+        self.baseline = None
+        self.calibrated = False
+        self.calibrating = False
+        self.calib_progress = 0.0
+        self.prev_metrics = None
+        self.metrics_lp = None
+
+    def _stable_enough(self, metrics):
+        """Check if metrics are stable enough for calibration."""
+        if metrics is None:
+            return False
+        if self.prev_metrics is None:
+            self.prev_metrics = metrics
+            return False
+        prev = self.prev_metrics
+        keys = ['span_xy', 'mean_z', 'depth_diff', 'angle_deg', 'size_avg']
+        norm = {
+            'span_xy': max(prev['span_xy'], metrics['span_xy'], 1e-3),
+            'mean_z': 0.05,
+            'depth_diff': 0.05,
+            'angle_deg': 60.0,
+            'size_avg': max(prev['size_avg'], metrics['size_avg'], 1e-3),
+        }
+        diff = 0.0
+        count = 0
+        for k in keys:
+            dv = abs(metrics[k] - prev[k])
+            diff += dv / norm[k]
+            count += 1
+        diff = diff / max(count, 1)
+        self.prev_metrics = metrics
+        return diff < self.calib_stable_norm_thr
+
+    def filter_metrics(self, metrics, dt):
+        """Low-pass filter noisy handlebar metrics."""
+        if metrics is None:
+            self.metrics_lp = None
+            return None
+
+        if self.metrics_lp is None:
+            self.metrics_lp = metrics.copy()
+            return metrics
+
+        alpha = clamp(dt * self.metrics_smoothing, 0.0, 1.0)
+        out = metrics.copy()
+        for k in ('span_xy', 'mean_z', 'depth_diff', 'size_avg'):
+            prev = self.metrics_lp.get(k, metrics[k])
+            out[k] = float(lerp(prev, metrics[k], alpha))
+
+        # angle needs wrap-aware interpolation
+        prev_ang = self.metrics_lp.get('angle_deg', metrics['angle_deg'])
+        ang_delta = _angle_diff_deg(metrics['angle_deg'], prev_ang)
+        out['angle_deg'] = float(prev_ang + ang_delta * alpha)
+
+        self.metrics_lp = out
+        return out
+
+    def calibration_tick(self, metrics, dt, requested=False):
+        """Process calibration state machine."""
+        if metrics is None:
+            self.calibrating = False
+            self.calib_progress = 0.0
+            self.prev_metrics = None
+            return {'calibrating': False, 'progress': 0.0, 'calibrated_now': False}
+
+        should_start = requested or (self.baseline is None)
+        if should_start and not self.calibrating:
+            self.calibrating = True
+            self.calib_progress = 0.0
+
+        if not self.calibrating:
+            return {'calibrating': False, 'progress': 0.0, 'calibrated_now': False}
+
+        stable = self._stable_enough(metrics)
+        if stable:
+            self.calib_progress = clamp(self.calib_progress + dt / self.calib_hold, 0.0, 1.0)
+        else:
+            self.calib_progress = 0.0
+
+        if self.calib_progress >= 1.0:
+            self.baseline = metrics.copy()
+            self.calibrated = True
+            self.calibrating = False
+            self.calib_progress = 0.0
+            return {'calibrating': False, 'progress': 1.0, 'calibrated_now': True}
+
+        return {'calibrating': True, 'progress': self.calib_progress, 'calibrated_now': False}
+
+    def smooth_and_quantize(self, spd, direc, dt):
+        """Smooth and quantize speed and direction values."""
+        t = clamp(dt * 6.0, 0.0, 1.0)
+        self._f_speed = lerp(self._f_speed, spd, t)
+        self._f_dir = lerp(self._f_dir, direc, t)
+
+        if abs(self._f_speed) < self.zero_lock:
+            self._f_speed = 0.0
+        if abs(self._f_dir) < self.zero_lock:
+            self._f_dir = 0.0
+
+        target_speed = quantize(clamp(self._f_speed, -1.0, 1.0), self.quant_step)
+        target_dir = quantize(clamp(self._f_dir, -1.0, 1.0), self.quant_step)
+
+        stick = self.quant_step * self.command_hysteresis
+        if abs(target_speed - self.speed) < stick:
+            target_speed = self.speed
+        if abs(target_dir - self.direction) < stick:
+            target_dir = self.direction
+
+        self.speed = target_speed
+        self.direction = target_dir
+
+        self.speed_cmd = int(round(self.speed / self.quant_step))
+        self.direction_cmd = int(round(self.direction / self.quant_step))
+
+    def handle_visibility(self, hands_ok, dt):
+        """Handle hand visibility loss with safety decay."""
+        now = time.time()
+        if hands_ok:
+            self._last_full_seen = now
+            self._lost = False
+            return False
+
+        if now - self._last_full_seen >= self.fail_timeout:
+            decay = math.exp(-self.decay_rate * dt)
+            self._f_speed *= decay
+            self._f_dir *= decay
+            self.speed = quantize(self._f_speed, self.quant_step)
+            self.direction = quantize(self._f_dir, self.quant_step)
+            self.speed_cmd = int(round(self.speed / self.quant_step))
+            self.direction_cmd = int(round(self.direction / self.quant_step))
+            self._lost = True
+            self.metrics_lp = None
+            return True
+        return False
 
 
-def speed_from_left_openness_facing(lm, state):
-    """Calculate speed from left hand openness and facing direction."""
-    openv = hand_openness_01(lm)
-    mag = clamp(1.0 - openv, 0.0, 1.0)
-    sign, dz = palm_facing_sign(lm)
-    if sign != 0:
-        state.left_speed_sign = sign
-    s = state.left_speed_sign * mag
-    s = 0.0 if abs(s) < 0.03 else s
-    return s, openv, dz, state.left_speed_sign
+def compute_bike_controls(lm_left, lm_right, state, metrics=None):
+    """Compute bike-like controls from two hands."""
+    metrics = metrics if metrics is not None else _handlebar_metrics(lm_left, lm_right)
+    if state.baseline is None:
+        return 0.0, 0.0, metrics, {'calibrating': True}
+
+    base = state.baseline
+    info = {'calibrating': False}
+
+    speed_gain = 2.2
+    steering_gain = 2.2
+
+    # Speed: push both hands forward / enlarge handlebar span
+    depth_push = clamp((base['mean_z'] - metrics['mean_z']) / state.depth_range, -1.0, 1.0)
+    size_push = clamp(
+        (metrics['size_avg'] - base['size_avg']) / (base['size_avg'] * state.size_range + 1e-6),
+        -1.0, 1.0
+    )
+    span_push = clamp(
+        (metrics['span_xy'] - base['span_xy']) / (base['span_xy'] * 0.7 + 1e-6),
+        -1.0, 1.0
+    )
+
+    speed_raw = speed_gain * 0.55 * depth_push + 0.35 * size_push + 0.10 * span_push
+    speed_raw = clamp(deadzone(speed_raw, 0.06), -1.0, 1.0)
+
+    # Steering: left hand forward / right hand back or bar tilt
+    steer_depth = clamp(metrics['depth_diff'] / state.turn_depth_range, -1.0, 1.0)
+    ang_delta = _angle_diff_deg(metrics['angle_deg'], base['angle_deg'])
+    steer_angle = clamp(ang_delta / 45.0, -1.0, 1.0)
+
+    steering_raw = steering_gain * 0.70 * steer_depth + 0.30 * steer_angle
+    steering_raw = clamp(deadzone(steering_raw, 0.05), -1.0, 1.0)
+
+    info.update({
+        'depth_push': depth_push,
+        'size_push': size_push,
+        'span_push': span_push,
+        'steer_depth': steer_depth,
+        'steer_angle': steer_angle,
+        'baseline_angle': base['angle_deg'],
+    })
+    return speed_raw, steering_raw, metrics, info
 
 
 class HandDriveNode(Node):
-    """ROS2 node for hand gesture robot control."""
+    """ROS2 node for handlebar-style hand gesture robot control."""
 
     def __init__(self):
         super().__init__("hand_drive_node")
@@ -258,7 +465,6 @@ class HandDriveNode(Node):
         self.declare_parameter("max_linear_vel", 0.22)  # TurtleBot3 max: 0.22 m/s
         self.declare_parameter("max_angular_vel", 2.84)  # TurtleBot3 max: 2.84 rad/s
         self.declare_parameter("camera_id", 0)
-        self.declare_parameter("camera_url", "")
         self.declare_parameter("show_preview", True)
         self.declare_parameter("publish_rate", 15.0)  # Hz
 
@@ -279,31 +485,22 @@ class HandDriveNode(Node):
             self.get_parameter("publish_rate").get_parameter_value().double_value
         )
 
-        self.camera_url = self.get_parameter("camera_url").get_parameter_value().string_value
-
         # Publishers
         self.cmd_vel_pub = self.create_publisher(Twist, "cmd_vel", 10)
         self.drive_enabled_pub = self.create_publisher(Bool, "drive_enabled", 10)
 
-        # Initialize camera (device index OR RTSP/URL)
-        if self.camera_url:
-            self.get_logger().info(f"Opening camera_url: {self.camera_url}")
-            self.cap = cv2.VideoCapture(self.camera_url, cv2.CAP_FFMPEG)
-            src = self.camera_url
-        else:
-            self.get_logger().info(f"Opening camera_id: {self.camera_id}")
-            self.cap = cv2.VideoCapture(self.camera_id)
-            src = str(self.camera_id)
-
+        # Initialize camera
+        self.cap = cv2.VideoCapture(self.camera_id)
         if not self.cap.isOpened():
-            self.get_logger().error(f"Cannot open camera source: {src}")
-            raise RuntimeError(f"Cannot open camera source: {src}")
+            self.get_logger().error(f"Cannot open camera {self.camera_id}")
+            raise RuntimeError(f"Cannot open camera {self.camera_id}")
 
-        self.get_logger().info(f"Camera source opened: {src}")
+        self.get_logger().info(f"Camera {self.camera_id} opened successfully")
 
         # Initialize state
         self.state = DriveState()
         self.font = cv2.FONT_HERSHEY_SIMPLEX
+        self.prev_time = time.time()
 
         # Initialize MediaPipe hands
         self.hands = mp_hands.Hands(
@@ -318,7 +515,7 @@ class HandDriveNode(Node):
         timer_period = 1.0 / self.publish_rate
         self.timer = self.create_timer(timer_period, self.timer_callback)
 
-        self.get_logger().info("Hand Drive Node initialized")
+        self.get_logger().info("Hand Drive Node initialized (Handlebar Mode)")
         self.get_logger().info(
             f"Max velocities: linear={self.max_linear_vel} m/s, angular={self.max_angular_vel} rad/s"
         )
@@ -330,13 +527,17 @@ class HandDriveNode(Node):
             self.get_logger().warn("Failed to read frame from camera")
             return
 
+        now = time.time()
+        dt = now - self.prev_time
+        self.prev_time = now
+
         frame = cv2.flip(frame, 1)
         h, w, _ = frame.shape
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         res = self.hands.process(rgb)
 
         left = right = None
-        
+
         if res.multi_hand_landmarks and res.multi_handedness:
             packs = []
             for lm, hd in zip(res.multi_hand_landmarks, res.multi_handedness):
@@ -355,54 +556,59 @@ class HandDriveNode(Node):
                             frame, pack[0], mp_hands.HAND_CONNECTIONS
                         )
 
-            # Compute openness for arming
-            left_open_val = (
-                hand_openness_01(left[0].landmark) >= 0.85 if left else False
-            )
-            right_open_val = (
-                hand_openness_01(right[0].landmark) >= 0.85 if right else False
-            )
-            both_open = left_open_val and right_open_val
+        # Arming (both hands open for a hold)
+        left_open_val = (
+            hand_openness_01(left[0].landmark) >= 0.85 if left else False
+        )
+        right_open_val = (
+            hand_openness_01(right[0].landmark) >= 0.85 if right else False
+        )
+        both_open = left_open_val and right_open_val
+        p = self.state.update_arming(both_open)
 
-            # Update arming state
-            p = self.state.update_arming(both_open)
+        # Bike-like control computation
+        hands_ok = (left is not None) and (right is not None)
+        lost_active = self.state.handle_visibility(hands_ok, dt)
 
-            # Compute speed and direction
-            spd_raw = 0.0
-            dir_raw = 0.0
+        # If both hands disappear for long enough, queue a recalibration
+        if lost_active and left is None and right is None and not self.state.calib_requested:
+            self.state.calib_requested = True
 
-            # LEFT: speed from openness + facing
-            if left:
-                lmL = left[0].landmark
-                spd_raw, _, _, _ = speed_from_left_openness_facing(lmL, self.state)
+        metrics = None
+        calib_info = {'calibrating': False, 'progress': 0.0, 'calibrated_now': False}
 
-            # RIGHT: direction from fist roll
-            right_is_fist = False
-            if right:
-                lmR = right[0].landmark
-                if right_is_fist_simple(lmR):
-                    right_is_fist = True
-                    dir_raw, _ = direction_from_right_fist_roll(lmR)
-                else:
-                    dir_raw = 0.0
+        if hands_ok:
+            metrics_raw = _handlebar_metrics(left[0].landmark, right[0].landmark)
+            metrics = self.state.filter_metrics(metrics_raw, dt)
+            calib_info = self.state.calibration_tick(metrics, dt, requested=self.state.calib_requested)
+            if calib_info.get('calibrated_now'):
+                self.state.calib_requested = False
+                self.get_logger().info("Calibration complete - origin set")
 
-            # Update filtered state
-            self.state.set_speed_dir(spd_raw, dir_raw)
-
-            # Draw UI if preview enabled
-            if self.show_preview:
-                self._draw_ui(frame, h, w, p, both_open, left, right, right_is_fist)
+            if self.state.baseline is not None and not self.state.calibrating:
+                speed_raw, dir_raw, _, _ = compute_bike_controls(
+                    left[0].landmark, right[0].landmark, self.state, metrics=metrics
+                )
+                self.state.smooth_and_quantize(speed_raw, dir_raw, dt)
+            else:
+                self.state.smooth_and_quantize(0.0, 0.0, dt)
         else:
-            # No hands detected
-            if self.show_preview:
-                self._draw_no_hands_ui(frame, h, w)
+            self.state.filter_metrics(None, dt)
+            self.state.calibration_tick(None, dt, requested=False)
+            if not lost_active:
+                # short glitch: gently return to neutral
+                self.state.smooth_and_quantize(0.0, 0.0, dt)
+
+        # Draw UI if preview enabled
+        if self.show_preview:
+            self._draw_ui(frame, h, w, p, both_open, hands_ok, calib_info, lost_active)
 
         # Publish messages
         self._publish_commands()
 
         # Show preview window
         if self.show_preview:
-            cv2.imshow("Hand Gesture Robot Control", frame)
+            cv2.imshow("Bike Hands Drive (push=throttle, left hand forward=turn left)", frame)
             key = cv2.waitKey(1) & 0xFF
             if key in (27, ord("q")):
                 self.get_logger().info("Quit requested, shutting down...")
@@ -412,15 +618,22 @@ class HandDriveNode(Node):
                 self.get_logger().info(
                     f"Drive {'ENABLED' if self.state.enabled else 'DISABLED'} (keyboard toggle)"
                 )
+            elif key in (ord("c"), ord("C")):
+                self.state.reset_calibration()
+                self.state.calib_requested = True
+                self.get_logger().info("Calibration reset requested")
 
     def _publish_commands(self):
         """Publish velocity commands and drive state."""
         twist = Twist()
 
+        cmd_speed = self.state.speed_cmd if self.state.enabled else 0
+        cmd_dir = self.state.direction_cmd if self.state.enabled else 0
+
         if self.state.enabled:
-            # Scale normalized values to actual velocities
-            twist.linear.x = self.state.speed * self.max_linear_vel
-            twist.angular.z = -self.state.direction * self.max_angular_vel
+            # Scale quantized values to actual velocities
+            twist.linear.x = cmd_speed * self.state.quant_step * self.max_linear_vel
+            twist.angular.z = -cmd_dir * self.state.quant_step * self.max_angular_vel
         else:
             twist.linear.x = 0.0
             twist.angular.z = 0.0
@@ -432,13 +645,12 @@ class HandDriveNode(Node):
         enabled_msg.data = self.state.enabled
         self.drive_enabled_pub.publish(enabled_msg)
 
-    def _draw_ui(self, frame, h, w, p, both_open, left, right, right_is_fist):
+    def _draw_ui(self, frame, h, w, p, both_open, hands_ok, calib_info, lost_active):
         """Draw UI overlay on frame."""
-        # Status text and progress bar
         status_txt = f"Drive {'ENABLED' if self.state.enabled else 'DISABLED'}"
         txt_org = (20, 40)
 
-        # Determine colors based on state
+        # While arming, preview the future state color
         if p is not None and both_open:
             future_enabled = not self.state.enabled
             txt_color = (0, 255, 0) if future_enabled else (0, 0, 255)
@@ -450,101 +662,20 @@ class HandDriveNode(Node):
             p_disp = 1.0 if self.state.enabled else 0.0
 
         cv2.putText(frame, status_txt, txt_org, self.font, 0.9, txt_color, 2)
-
-        # Progress bar
         (tw, th), _ = cv2.getTextSize(status_txt, self.font, 0.9, 2)
         bar_w, bar_h = 140, 18
         bar_x = txt_org[0] + tw + 12
         bar_y = txt_org[1] - th + 2
         draw_progress_bar(frame, bar_x, bar_y, bar_w, bar_h, p_disp, color=bar_color)
 
-        # Speed display
-        speed_y = h - 50
-        if left:
-            cv2.putText(
-                frame,
-                f"Speed = {self.state.speed:+.2f}",
-                (20, speed_y),
-                self.font,
-                0.7,
-                (255, 0, 0),
-                2,
-            )
-        else:
-            cv2.putText(
-                frame,
-                "Speed = N/A (no left hand)",
-                (20, speed_y),
-                self.font,
-                0.7,
-                (255, 0, 0),
-                2,
-            )
-
-        # Direction display
-        dir_y = h - 20
-        if right:
-            if right_is_fist:
-                cv2.putText(
-                    frame,
-                    f"Direction = {self.state.direction:+.2f}",
-                    (20, dir_y),
-                    self.font,
-                    0.7,
-                    (0, 255, 255),
-                    2,
-                )
-            else:
-                cv2.putText(
-                    frame,
-                    "Direction = 0.00 (right not fist)",
-                    (20, dir_y),
-                    self.font,
-                    0.7,
-                    (0, 255, 255),
-                    2,
-                )
-        else:
-            cv2.putText(
-                frame,
-                "Direction = N/A (no right hand)",
-                (20, dir_y),
-                self.font,
-                0.7,
-                (0, 255, 255),
-                2,
-            )
-
-        # ROS2 info
-        cv2.putText(
-            frame,
-            f"Publishing: linear={self.state.speed * self.max_linear_vel:.2f} m/s, "
-            f"angular={-self.state.direction * self.max_angular_vel:.2f} rad/s",
-            (20, 70),
-            self.font,
-            0.5,
-            (200, 200, 200),
-            1,
-        )
-
-    def _draw_no_hands_ui(self, frame, h, w):
-        """Draw UI when no hands are detected."""
-        status_txt = f"Drive {'ENABLED' if self.state.enabled else 'DISABLED'}"
-        txt_org = (20, 40)
-        cv2.putText(frame, status_txt, txt_org, self.font, 0.9, (0, 255, 255), 2)
-
-        (tw, th), _ = cv2.getTextSize(status_txt, self.font, 0.9, 2)
-        bar_w, bar_h = 140, 18
-        bar_x = txt_org[0] + tw + 12
-        bar_y = txt_org[1] - th + 2
-        p_disp = 1.0 if self.state.enabled else 0.0
-        bar_color = (0, 255, 0) if self.state.enabled else (0, 0, 255)
-        draw_progress_bar(frame, bar_x, bar_y, bar_w, bar_h, p_disp, color=bar_color)
+        # Command display
+        cmd_speed = self.state.speed_cmd if self.state.enabled else 0
+        cmd_dir = self.state.direction_cmd if self.state.enabled else 0
 
         cv2.putText(
             frame,
-            "Speed = N/A (no left hand)",
-            (20, h - 50),
+            f"Cmd speed: {cmd_speed:+02d} ({cmd_speed * self.state.quant_step:+.2f})",
+            (20, h - 70),
             self.font,
             0.7,
             (255, 0, 0),
@@ -552,12 +683,65 @@ class HandDriveNode(Node):
         )
         cv2.putText(
             frame,
-            "Direction = N/A (no right hand)",
-            (20, h - 20),
+            f"Cmd steer: {cmd_dir:+02d} ({cmd_dir * self.state.quant_step:+.2f})",
+            (20, h - 40),
             self.font,
             0.7,
             (0, 255, 255),
             2,
+        )
+
+        # Status messages
+        if calib_info.get('calibrating'):
+            ptxt = f"Calibrating origin... {int(calib_info.get('progress', 0) * 100):02d}%"
+            cv2.putText(frame, ptxt, (20, h - 100), self.font, 0.6, (0, 200, 0), 2)
+        elif self.state.calib_requested and not self.state.calibrating:
+            cv2.putText(
+                frame,
+                "Auto recalibration pending: show both hands and hold still",
+                (20, h - 100),
+                self.font,
+                0.6,
+                (0, 165, 255),
+                2,
+            )
+        elif self.state.baseline is None:
+            cv2.putText(
+                frame,
+                "Hold still or press 'C' to set origin",
+                (20, h - 100),
+                self.font,
+                0.6,
+                (0, 165, 255),
+                2,
+            )
+        elif lost_active:
+            msg = "SAFE STOP (hands lost)"
+            if self.state.calib_requested:
+                msg += " - auto recalibration will start when hands return"
+            cv2.putText(frame, msg, (20, h - 100), self.font, 0.6, (0, 0, 255), 2)
+        elif not hands_ok:
+            cv2.putText(
+                frame,
+                "Need both hands visible",
+                (20, h - 100),
+                self.font,
+                0.6,
+                (0, 165, 255),
+                2,
+            )
+
+        # ROS2 info
+        linear_vel = cmd_speed * self.state.quant_step * self.max_linear_vel
+        angular_vel = -cmd_dir * self.state.quant_step * self.max_angular_vel
+        cv2.putText(
+            frame,
+            f"Publishing: linear={linear_vel:.2f} m/s, angular={angular_vel:.2f} rad/s",
+            (20, 70),
+            self.font,
+            0.5,
+            (200, 200, 200),
+            1,
         )
 
     def destroy_node(self):
@@ -585,4 +769,3 @@ def main(args=None):
 
 if __name__ == "__main__":
     main()
-
