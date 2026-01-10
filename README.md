@@ -21,48 +21,49 @@ Control a robot using hand gestures detected via webcam. Uses a **handlebar anal
 
 ## Architecture
 
-The project supports two modes of operation:
+> 📖 **Full architecture documentation**: [ARCHITECTURE.md](ARCHITECTURE.md)
 
-### Mode 1: Direct ROS2 Node (Traditional)
-
-Camera → ROS2 Node → `/cmd_vel` → Robot
-
-### Mode 2: Client-Server Architecture (Recommended for Remote Control)
+The project uses a **client-server architecture** where gesture recognition runs locally on your laptop, and the server bridges to ROS2 and ESP32 via MQTT.
 
 ```
-┌──────────────────────────────────────────────────────────────────────┐
-│  CLIENT (User Laptop)                                                │
-│  ┌─────────┐   ┌─────────────┐   ┌─────────────┐   ┌──────────────┐ │
-│  │ Camera/ │ → │ Frame Gate  │ → │ MediaPipe   │ → │ Hand Control │ │
-│  │ RTSP    │   │ (validate)  │   │ Hands       │   │ Logic        │ │
-│  └─────────┘   └─────────────┘   └─────────────┘   └──────────────┘ │
-│                                                           │          │
-│                                          ┌────────────────┘          │
-│                                          ▼                           │
-│                                   ┌──────────────┐                   │
-│                                   │ JSON Message │                   │
-│                                   │ Validator    │                   │
-│                                   └──────────────┘                   │
-│                                          │                           │
-└──────────────────────────────────────────│───────────────────────────┘
-                                           │ WebSocket
-                                           ▼
-┌──────────────────────────────────────────────────────────────────────┐
-│  SERVER (Robot Machine)                                              │
-│  ┌──────────────┐                                                    │
-│  │ WS Server    │ ──┬──→ ROS2 Bridge ──→ /cmd_vel ──→ Robot         │
-│  │ (auth+lock)  │   │                                                │
-│  └──────────────┘   └──→ MQTT Bridge ──→ ESP32 ──→ Motors           │
-│                                                                      │
-│  Deadman Timer: Auto-stop if no message for 300ms                   │
-└──────────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  CLIENT (Your Laptop - macOS/Windows/Linux)                                 │
+│                                                                             │
+│   Camera → Frame Gate → MediaPipe → Hand Control → JSON → WebSocket        │
+│            (validate)               (gestures)     (validate)               │
+└─────────────────────────────────────────│───────────────────────────────────┘
+                                          │ ws://server:8080/control
+                                          ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  SERVER (Ubuntu VM / AWS EC2)                                               │
+│                                                                             │
+│   WebSocket ──┬──→ ROS2 Bridge ──→ /cmd_vel, /drive_enabled                │
+│   (auth)      │                                                             │
+│               └──→ MQTT Bridge ──→ robot/cmd ──→ ESP32 ──→ Motors          │
+│                                                                             │
+│   Deadman Timer: Auto-stop if no message for 300ms                         │
+└─────────────────────────────────────────────────────────────────────────────┘
 ```
 
-**Key Safety Features:**
-- Frame quality gate: Corrupted/missing RTSP frames do NOT produce commands
-- Hand quality gate: Both hands must be visible and calibrated
-- Message validation: NaN/Inf/out-of-bounds values are rejected
-- Deadman timer: Server stops robot if client goes silent
+### Why This Architecture?
+
+| Problem | Solution |
+|---------|----------|
+| RTSP H264 decoder errors produce corrupted frames | **Frame Gate** on client detects and drops bad frames |
+| Bad frames → wrong velocity commands | Gestures computed **locally**, only valid commands sent |
+| ESP32 can't run ROS2 easily | **MQTT Bridge** sends simple JSON to ESP32 |
+| Client and robot on different networks | Server can run on **cloud** (AWS EC2) with public IP |
+
+### Key Safety Features
+
+| Feature | Description |
+|---------|-------------|
+| 🖼️ **Frame Gate** | Drops corrupted/invalid frames before processing |
+| 🖐️ **Hand Gate** | Requires both hands visible + calibrated |
+| ✅ **Message Validation** | Rejects NaN/Inf/out-of-bounds values |
+| ⏱️ **Deadman Timer** | Server stops robot if silent for 300ms |
+| 🔒 **Single Controller** | Only one client can control at a time |
+| 🛑 **Graceful Shutdown** | Sends STOP on disconnect |
 
 ---
 
@@ -316,10 +317,37 @@ mosquitto -v
 
 ---
 
+## 🌐 Deployment Options
+
+> 📖 **Full details**: [ARCHITECTURE.md](ARCHITECTURE.md#deployment-options)
+
+| Setup | Client | Server | ESP32 | Best For |
+|-------|--------|--------|-------|----------|
+| **Local** | Same machine | Same machine | USB/local MQTT | Development |
+| **VM** | macOS | Ubuntu VM (192.168.64.x) | Local MQTT | Testing with ROS2 |
+| **Cloud** | Anywhere | AWS EC2 (public IP) | Internet MQTT | Production |
+
+### ESP32 Connection (MQTT)
+
+The ESP32 connects to the server via **MQTT** (not ROS2). Update your ESP32 firmware:
+
+```cpp
+// esp32_master.ino
+const char* mqtt_server = "YOUR_SERVER_IP";  // VM IP or EC2 public IP
+const int mqtt_port = 1883;
+```
+
+The server's MQTT bridge converts WebSocket commands to MQTT messages:
+- **Topic**: `robot/cmd`
+- **Format**: `{"left": -255..255, "right": -255..255}`
+
+---
+
 ## 📚 Documentation
 
 | Document | Description |
 |----------|-------------|
+| [ARCHITECTURE.md](ARCHITECTURE.md) | **System architecture, deployment options, ESP32 connection** |
 | [hand-gesture-robot/README.md](hand-gesture-robot/README.md) | Robot hardware setup |
 | [hand-gesture-robot/SETUP_GUIDE.md](hand-gesture-robot/SETUP_GUIDE.md) | Complete setup guide |
 | [hand-gesture-robot/firmware/README.md](hand-gesture-robot/firmware/README.md) | ESP32/Arduino firmware |

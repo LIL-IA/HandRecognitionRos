@@ -343,10 +343,9 @@ class HandControlClient:
             
         # Send message
         if self.ws_client and self.ws_client.connected:
-            if self.ws_client.send(clamped_msg):
+            success = await self.ws_client.send_async(clamped_msg)
+            if success:
                 self._force_stop_sent = False
-            else:
-                logger.warning("Failed to queue message")
                 
     async def _send_force_stop(self) -> None:
         """Send force stop message due to frame quality issues."""
@@ -363,7 +362,8 @@ class HandControlClient:
         msg = ControlMessage.stop_message()
         
         if self.ws_client and self.ws_client.connected:
-            if self.ws_client.send(msg):
+            success = await self.ws_client.send_async(msg)
+            if success:
                 self._force_stop_sent = True
                 logger.info("Force stop message sent")
                 

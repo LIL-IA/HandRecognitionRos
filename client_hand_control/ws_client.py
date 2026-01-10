@@ -4,7 +4,7 @@ WebSocket Client for server communication.
 Handles:
 - Async WebSocket connection with Bearer token auth
 - Exponential backoff reconnection
-- Message queue for decoupled sending
+- Direct message sending (no queue bottleneck)
 - Clean shutdown with final STOP message
 """
 
@@ -48,7 +48,7 @@ class WebSocketClient:
     Features:
     - Bearer token authentication
     - Exponential backoff on connection failure (1s -> 30s max)
-    - Non-blocking message sending via queue
+    - Direct send (no queue to avoid bottleneck)
     - Graceful shutdown with final STOP message
     """
     
@@ -85,18 +85,17 @@ class WebSocketClient:
         self._running = False
         self._shutdown_requested = False
         
-        # Message queue
-        self._send_queue: asyncio.Queue[Optional[str]] = asyncio.Queue(maxsize=100)
-        
         # Statistics
         self.stats = ConnectionStats()
         
         # Backoff state
         self._current_backoff = initial_backoff_seconds
         
+        # Lock for thread-safe sends
+        self._send_lock = asyncio.Lock()
+        
         # Tasks
         self._connect_task: Optional[asyncio.Task] = None
-        self._send_task: Optional[asyncio.Task] = None
         
     @property
     def connected(self) -> bool:
@@ -111,9 +110,8 @@ class WebSocketClient:
         self._running = True
         self._shutdown_requested = False
         
-        # Start connection manager and sender tasks
+        # Start connection manager task
         self._connect_task = asyncio.create_task(self._connection_loop())
-        self._send_task = asyncio.create_task(self._send_loop())
         
         logger.info(f"WebSocket client started, connecting to {self.server_url}")
         
@@ -130,13 +128,10 @@ class WebSocketClient:
         if self.connected:
             try:
                 stop_msg = ControlMessage.stop_message()
-                await self._send_immediate(stop_msg.to_json())
+                await self.send_async(stop_msg)
                 logger.info("Sent final STOP message")
             except Exception as e:
                 logger.warning(f"Failed to send final STOP: {e}")
-        
-        # Signal send loop to exit
-        await self._send_queue.put(None)
         
         # Cancel tasks
         if self._connect_task:
@@ -145,17 +140,13 @@ class WebSocketClient:
                 await self._connect_task
             except asyncio.CancelledError:
                 pass
-                
-        if self._send_task:
-            self._send_task.cancel()
-            try:
-                await self._send_task
-            except asyncio.CancelledError:
-                pass
         
         # Close WebSocket
         if self._ws:
-            await self._ws.close()
+            try:
+                await self._ws.close()
+            except Exception:
+                pass
             self._ws = None
             
         self._connected = False
@@ -163,22 +154,59 @@ class WebSocketClient:
         
     def send(self, message: ControlMessage) -> bool:
         """
-        Queue a message for sending.
+        Queue a message for sending (sync interface).
         
-        Non-blocking. Returns False if queue is full.
+        For the async main loop, this schedules the send.
         
         Args:
             message: ControlMessage to send
             
         Returns:
-            True if queued successfully, False if queue is full
+            True if send was initiated, False if not connected
         """
-        try:
-            self._send_queue.put_nowait(message.to_json())
-            return True
-        except asyncio.QueueFull:
+        if not self.connected:
             self.stats.messages_failed += 1
-            logger.warning("Send queue full, dropping message")
+            return False
+            
+        # Schedule async send
+        asyncio.create_task(self._do_send(message.to_json()))
+        return True
+    
+    async def send_async(self, message: ControlMessage) -> bool:
+        """
+        Send a message asynchronously.
+        
+        Args:
+            message: ControlMessage to send
+            
+        Returns:
+            True if sent successfully
+        """
+        if not self.connected:
+            self.stats.messages_failed += 1
+            return False
+            
+        return await self._do_send(message.to_json())
+            
+    async def _do_send(self, message: str) -> bool:
+        """Actually send the message."""
+        if not self._ws or not self._connected:
+            self.stats.messages_failed += 1
+            return False
+            
+        try:
+            async with self._send_lock:
+                await self._ws.send(message)
+            self.stats.messages_sent += 1
+            self.stats.last_send_time = time.time()
+            return True
+        except (ConnectionClosed, WebSocketException) as e:
+            self.stats.messages_failed += 1
+            logger.debug(f"Send failed: {e}")
+            return False
+        except Exception as e:
+            self.stats.messages_failed += 1
+            logger.warning(f"Send error: {e}")
             return False
             
     async def _connection_loop(self) -> None:
@@ -189,10 +217,6 @@ class WebSocketClient:
                 
                 # Reset backoff on successful connection
                 self._current_backoff = self.initial_backoff
-                
-                # Wait for disconnection
-                while self._connected and self._running:
-                    await asyncio.sleep(0.1)
                     
             except asyncio.CancelledError:
                 break
@@ -238,14 +262,22 @@ class WebSocketClient:
             if self.on_connected:
                 await self.on_connected()
                 
-            # Keep connection alive by listening for messages
-            try:
-                async for message in self._ws:
-                    # Server might send acknowledgements or status updates
-                    logger.debug(f"Received from server: {message}")
-            except ConnectionClosed:
-                pass
-                
+            # Keep connection alive - just wait for close, don't block on recv
+            # Use a ping-pong approach instead of blocking recv
+            while self._connected and self._running and not self._shutdown_requested:
+                try:
+                    # Check if connection is still alive with short timeout
+                    await asyncio.wait_for(
+                        self._ws.recv(),
+                        timeout=0.1
+                    )
+                except asyncio.TimeoutError:
+                    # No message received, that's fine - connection still alive
+                    continue
+                except ConnectionClosed:
+                    logger.info("Connection closed by server")
+                    break
+                    
         except InvalidStatusCode as e:
             logger.error(f"Authentication failed: {e.status_code}")
             raise
@@ -256,54 +288,13 @@ class WebSocketClient:
             logger.error(f"Connection failed: {e}")
             raise
         finally:
+            was_connected = self._connected
             self._connected = False
             self.stats.connected = False
             self.stats.disconnect_time = time.time()
             
-            if self.on_disconnected:
+            if was_connected and self.on_disconnected:
                 await self.on_disconnected()
-                
-    async def _send_loop(self) -> None:
-        """Process outgoing message queue."""
-        while self._running:
-            try:
-                # Wait for message with timeout
-                try:
-                    message = await asyncio.wait_for(
-                        self._send_queue.get(),
-                        timeout=1.0
-                    )
-                except asyncio.TimeoutError:
-                    continue
-                    
-                # None is shutdown signal
-                if message is None:
-                    break
-                    
-                # Only send if connected
-                if self.connected:
-                    try:
-                        await self._ws.send(message)
-                        self.stats.messages_sent += 1
-                        self.stats.last_send_time = time.time()
-                    except (ConnectionClosed, WebSocketException) as e:
-                        self.stats.messages_failed += 1
-                        logger.warning(f"Send failed: {e}")
-                else:
-                    # Not connected, drop message
-                    self.stats.messages_failed += 1
-                    
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                logger.error(f"Send loop error: {e}")
-                
-    async def _send_immediate(self, message: str) -> None:
-        """Send a message immediately, bypassing queue."""
-        if self._ws and self._connected:
-            await self._ws.send(message)
-            self.stats.messages_sent += 1
-            self.stats.last_send_time = time.time()
             
     def get_stats(self) -> dict:
         """Get connection statistics."""
@@ -315,112 +306,4 @@ class WebSocketClient:
             "messages_sent": self.stats.messages_sent,
             "messages_failed": self.stats.messages_failed,
             "last_send_time": self.stats.last_send_time,
-            "queue_size": self._send_queue.qsize(),
         }
-
-
-class SyncWebSocketClient:
-    """
-    Synchronous wrapper around WebSocketClient for use in non-async code.
-    
-    Runs the async client in a background thread.
-    """
-    
-    def __init__(
-        self,
-        server_url: str,
-        token: str,
-        max_backoff_seconds: float = 30.0,
-    ):
-        """
-        Initialize sync client wrapper.
-        
-        Args:
-            server_url: WebSocket server URL
-            token: Bearer token for authentication
-            max_backoff_seconds: Maximum backoff for reconnection
-        """
-        self.server_url = server_url
-        self.token = token
-        self.max_backoff = max_backoff_seconds
-        
-        self._client: Optional[WebSocketClient] = None
-        self._loop: Optional[asyncio.AbstractEventLoop] = None
-        self._thread: Optional[asyncio.Task] = None
-        self._started = False
-        
-    def start(self) -> None:
-        """Start the client in a background event loop."""
-        if self._started:
-            return
-            
-        # Create new event loop for background thread
-        self._loop = asyncio.new_event_loop()
-        
-        self._client = WebSocketClient(
-            server_url=self.server_url,
-            token=self.token,
-            max_backoff_seconds=self.max_backoff,
-        )
-        
-        # Run event loop in background
-        import threading
-        self._bg_thread = threading.Thread(
-            target=self._run_loop,
-            daemon=True
-        )
-        self._bg_thread.start()
-        self._started = True
-        
-        # Wait a moment for connection
-        import time
-        time.sleep(0.5)
-        
-    def _run_loop(self) -> None:
-        """Run the async event loop."""
-        asyncio.set_event_loop(self._loop)
-        self._loop.run_until_complete(self._client.start())
-        self._loop.run_forever()
-        
-    def stop(self) -> None:
-        """Stop the client."""
-        if not self._started:
-            return
-            
-        # Schedule stop in the event loop
-        if self._loop and self._client:
-            future = asyncio.run_coroutine_threadsafe(
-                self._client.stop(),
-                self._loop
-            )
-            future.result(timeout=5.0)
-            
-            self._loop.call_soon_threadsafe(self._loop.stop)
-            
-        self._started = False
-        
-    def send(self, message: ControlMessage) -> bool:
-        """
-        Queue a message for sending.
-        
-        Args:
-            message: ControlMessage to send
-            
-        Returns:
-            True if queued successfully
-        """
-        if self._client:
-            return self._client.send(message)
-        return False
-        
-    @property
-    def connected(self) -> bool:
-        """Check if connected."""
-        return self._client.connected if self._client else False
-        
-    def get_stats(self) -> dict:
-        """Get connection statistics."""
-        if self._client:
-            return self._client.get_stats()
-        return {}
-

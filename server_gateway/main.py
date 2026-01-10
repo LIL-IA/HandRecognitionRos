@@ -26,13 +26,21 @@ import logging
 import os
 import signal
 import sys
-from typing import Optional
+from typing import Optional, TYPE_CHECKING
 
 import uvicorn
 
 from .ws_server import WebSocketServer, ControlMessage
-from .ros_bridge import ROSBridgeManager
 from .mqtt_bridge import AsyncMQTTBridge
+
+# Conditionally import ROS bridge
+ROS_AVAILABLE = False
+ROSBridgeManager = None
+try:
+    from .ros_bridge import ROSBridgeManager
+    ROS_AVAILABLE = True
+except ImportError:
+    pass  # ROS2 not installed
 
 # Configure logging
 logging.basicConfig(
@@ -103,7 +111,7 @@ class ServerGateway:
         logger.info("Starting Server Gateway...")
         
         # Start ROS bridge
-        if self.enable_ros:
+        if self.enable_ros and ROSBridgeManager is not None:
             try:
                 self.ros_bridge = ROSBridgeManager(deadman_ms=self.deadman_ms)
                 self.ros_bridge.start()
@@ -112,6 +120,8 @@ class ServerGateway:
                 logger.error(f"Failed to start ROS bridge: {e}")
                 logger.warning("Continuing without ROS bridge")
                 self.ros_bridge = None
+        else:
+            logger.info("Running in MQTT-only mode (no ROS2)")
         
         # Start MQTT bridge
         if self.enable_mqtt:
@@ -239,12 +249,9 @@ async def main_async() -> None:
     mqtt_port = int(os.environ.get("MQTT_PORT", "1883"))
     
     # Check if ROS is available
-    enable_ros = True
-    try:
-        import rclpy
-    except ImportError:
+    enable_ros = ROS_AVAILABLE
+    if not enable_ros:
         logger.warning("ROS2 (rclpy) not available, running without ROS bridge")
-        enable_ros = False
         
     # Check if MQTT is available
     enable_mqtt = True
