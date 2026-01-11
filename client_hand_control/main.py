@@ -519,15 +519,20 @@ async def main_async(args: argparse.Namespace) -> None:
         invalid_timeout_ms=args.invalid_timeout,
     )
     
-    # Handle shutdown signals
-    loop = asyncio.get_event_loop()
-    
-    def signal_handler():
-        logger.info("Shutdown signal received")
-        asyncio.create_task(client.stop())
+    # Handle shutdown signals (Unix only - Windows uses KeyboardInterrupt)
+    import sys
+    if sys.platform != 'win32':
+        loop = asyncio.get_event_loop()
         
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        loop.add_signal_handler(sig, signal_handler)
+        def signal_handler():
+            logger.info("Shutdown signal received")
+            asyncio.create_task(client.stop())
+            
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            try:
+                loop.add_signal_handler(sig, signal_handler)
+            except NotImplementedError:
+                pass  # Windows doesn't support signal handlers in asyncio
         
     try:
         await client.start()
