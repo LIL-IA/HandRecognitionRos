@@ -227,9 +227,9 @@ class DriveState:
         # Quantized command outputs
         self.speed_cmd = 0
         self.direction_cmd = 0
-        self.quant_step = 0.1  # -> integer steps -10..10
-        self.command_hysteresis = 0.55
-        self.zero_lock = 0.02
+        self.quant_step = 0.1  # Integer steps -10..10
+        self.command_hysteresis = 0.6  # Sticky to prevent flicker
+        self.zero_lock = 0.03  # Deadzone near zero
 
         # Calibration state
         self.baseline: Optional[Dict[str, Any]] = None
@@ -250,9 +250,10 @@ class DriveState:
         self.metrics_smoothing = 6.0
 
         # Ranges for bike-like control
-        self.depth_range = 0.06
-        self.size_range = 0.40
-        self.turn_depth_range = 0.05
+        self.depth_range_forward = 0.05  # Push hands toward camera for forward
+        self.depth_range_reverse = 0.03  # Pull hands back for reverse (more sensitive)
+        self.size_range = 0.30           # How much to spread hands for speed boost
+        self.turn_depth_range = 0.06     # Steering requires larger hand difference
 
     def update_arming(self, both_open: bool) -> Optional[float]:
         """
@@ -485,38 +486,42 @@ def compute_bike_controls(
     base = state.baseline
     info = {'calibrating': False}
 
-    speed_gain = 2.2
-    steering_gain = 2.2
-
-    # Speed: push both hands forward / enlarge handlebar span
-    depth_push = clamp(
-        (base['mean_z'] - metrics['mean_z']) / state.depth_range, 
-        -1.0, 1.0
-    )
+    # Speed: push both hands forward / pull back
+    # Positive depth_delta = hands closer to camera = forward
+    # Negative depth_delta = hands farther from camera = reverse
+    depth_delta = base['mean_z'] - metrics['mean_z']
+    
+    # Asymmetric sensitivity: reverse is more sensitive
+    if depth_delta >= 0:
+        # Forward
+        depth_push = clamp(depth_delta / state.depth_range_forward, 0.0, 1.0)
+    else:
+        # Reverse (more sensitive)
+        depth_push = clamp(depth_delta / state.depth_range_reverse, -1.0, 0.0)
+    
     size_push = clamp(
         (metrics['size_avg'] - base['size_avg']) / (base['size_avg'] * state.size_range + 1e-6),
-        -1.0, 1.0
-    )
-    span_push = clamp(
-        (metrics['span_xy'] - base['span_xy']) / (base['span_xy'] * 0.7 + 1e-6),
-        -1.0, 1.0
+        -0.3, 0.3  # Secondary effect, limited range
     )
 
-    speed_raw = speed_gain * 0.55 * depth_push + 0.35 * size_push + 0.10 * span_push
-    speed_raw = clamp(deadzone(speed_raw, 0.06), -1.0, 1.0)
+    # Speed is primarily depth-based
+    speed_combined = depth_push + size_push
+    # Apply deadzone to reject noise
+    speed_raw = clamp(deadzone(speed_combined, 0.08), -1.0, 1.0)
 
-    # Steering: left hand forward / right hand back or bar tilt
+    # Steering: left hand forward / right hand back
     steer_depth = clamp(metrics['depth_diff'] / state.turn_depth_range, -1.0, 1.0)
     ang_delta = _angle_diff_deg(metrics['angle_deg'], base['angle_deg'])
-    steer_angle = clamp(ang_delta / 45.0, -1.0, 1.0)
+    steer_angle = clamp(ang_delta / 60.0, -1.0, 1.0)  # Less sensitive to tilt
 
-    steering_raw = steering_gain * 0.70 * steer_depth + 0.30 * steer_angle
-    steering_raw = clamp(deadzone(steering_raw, 0.05), -1.0, 1.0)
+    # Steering is primarily depth-based (one hand forward, one back)
+    steering_combined = 0.85 * steer_depth + 0.15 * steer_angle
+    # LARGE deadzone: need deliberate movement to steer (default is straight)
+    steering_raw = clamp(deadzone(steering_combined, 0.25), -1.0, 1.0)
 
     info.update({
         'depth_push': depth_push,
         'size_push': size_push,
-        'span_push': span_push,
         'steer_depth': steer_depth,
         'steer_angle': steer_angle,
         'baseline_angle': base['angle_deg'],
